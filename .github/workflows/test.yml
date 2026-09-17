@@ -1,0 +1,44 @@
+name: CPU checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client-and-syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check source syntax and project metadata
+        run: |
+          python - <<'PY'
+          import ast
+          import pathlib
+          import subprocess
+          import tomllib
+
+          for name in subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0"):
+              path = pathlib.Path(name)
+              if path.suffix == ".py":
+                  ast.parse(path.read_text(encoding="utf-8"), filename=name)
+              elif path.suffix == ".sh":
+                  subprocess.run(["bash", "-n", name], check=True)
+              elif path.suffix == ".toml" or name == "uv.lock":
+                  tomllib.loads(path.read_text(encoding="utf-8"))
+          PY
+
+      - name: Install the lightweight client and test runner
+        run: python -m pip install ./packages/openpi-client "pytest>=8.3.4,<9"
+
+      - name: Test serialization and image preprocessing
+        run: python -m pytest -q packages/openpi-client
