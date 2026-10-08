@@ -56,8 +56,6 @@ def _write_sidecar(
 def sealed_sidecar(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     directory = tmp_path_factory.mktemp("oracle") / "sidecar"
     raw = _phases((1, 8), (2, 10), (3, 10), (4, 8))
-    decision = oracle.assess_episode(raw, len(raw) - 1, replan_steps=10)
-    assert decision.included
     episodes = []
     records = []
     global_cursor = 0
@@ -67,6 +65,25 @@ def sealed_sidecar(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
             range(oracle.LEGACY_EXPECTED_EPISODES_PER_TASK), key=lambda value: f"episode{value}"
         ):
             prompt = f"Synthetic overall instruction for {task}."
+            rows = np.arange(len(raw))
+            if manual := oracle.MANUAL_RAW_BOUNDARIES.get((task, episode_number)):
+                rows = np.concatenate(
+                    [
+                        np.arange(8),
+                        np.arange(manual[0], manual[0] + 10),
+                        np.arange(manual[1], manual[1] + 10),
+                        np.arange(manual[2], manual[2] + 8),
+                    ]
+                )
+            decision = oracle.assess_source_episode(
+                raw,
+                len(raw) - 1,
+                10,
+                source_task_name=task,
+                source_episode_number=episode_number,
+                raw_observation_row=rows,
+            )
+            assert decision.included
             episodes.append(
                 oracle.make_episode_audit(
                     source_task_name=task,
@@ -78,6 +95,7 @@ def sealed_sidecar(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
                     raw_phases=raw,
                     decision=decision,
                     replan_steps=10,
+                    raw_observation_row=rows,
                 )
             )
             records.extend(
@@ -182,92 +200,143 @@ def test_unmappable_episode_is_excluded(raw: np.ndarray, reason: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("task", "number", "boundaries"),
+    "raw",
     [
-        ("bimanual_pick_plate", 16, (90, 242, 266)),
-        ("bimanual_pick_fork", 0, (77, 190, 228)),
-        ("bimanual_pivot_phone", 66, (102, 200, 263)),
+        _phases((1, 20), (2, 20), (1, 10), (2, 10), (3, 20), (2, 10), (3, 10), (4, 20), (3, 10)),
+        # The first entries into phases 3 and 4 both follow a regression to phase 1.
+        _phases((1, 20), (2, 20), (1, 20), (3, 20), (1, 20), (4, 20), (3, 10)),
+        # A later adjacent 2->3 or 3->4 must not replace the earlier phase entry.
+        _phases((1, 20), (2, 20), (1, 20), (3, 10), (2, 10), (3, 10), (2, 10), (4, 10), (3, 10), (4, 10)),
     ],
 )
-def test_manual_review_recovers_all_frames_with_exact_transition_starts(
-    task: str, number: int, boundaries: tuple[int, int, int]
-) -> None:
-    raw = _phases((1, 20), (2, 20), (1, 20), (2, 80), (3, 80), (4, 140))
-    original = raw.copy()
-    assert not oracle.assess_episode(raw, len(raw) - 1, 10).included
-
-    decision = oracle.assess_source_episode(raw, len(raw) - 1, 10, source_task_name=task, source_episode_number=number)
-
-    assert decision.included
-    assert not decision.reasons
-    assert decision.boundaries == boundaries
-    assert [anchor.frame_index for anchor in decision.anchors] == list(range(len(raw) - 1))
-    for phase, boundary in enumerate(boundaries, start=1):
-        assert decision.cleaned.clean[boundary - 1] == phase
-        assert decision.cleaned.clean[boundary] == phase + 1
-        assert [a.frame_index for a in decision.anchors if a.subtask_type == f"{phase}_to_{phase + 1}"] == list(
-            range(boundary, boundary + 10)
-        )
-        assert decision.anchors[boundary + 10].subtask_type == str(phase + 1)
-    np.testing.assert_array_equal(raw, original)
-
-
-def test_manual_review_leaves_automatically_included_episode_unchanged() -> None:
-    raw = _phases((1, 8), (2, 10), (3, 10), (4, 8))
+def test_first_transitions_repair_excluded_episode_and_round_trip(tmp_path: pathlib.Path, raw: np.ndarray) -> None:
+    automatic = oracle.assess_episode(raw, len(raw) - 1, 10)
+    assert not automatic.included
     decision = oracle.assess_source_episode(
-        raw, len(raw) - 1, 10, source_task_name="bimanual_pick_plate", source_episode_number=16
+        raw,
+        len(raw) - 1,
+        10,
+        source_task_name="bimanual_pick_fork",
+        source_episode_number=91,
     )
     assert decision.included
-    assert decision.boundaries == (8, 18, 28)
-    np.testing.assert_array_equal(decision.cleaned.clean, raw)
+    assert decision.boundaries == (20, 60, 100)
+    assert decision.cleaned.clean[40] == 2  # Ignore the later return to phase 1.
+    assert decision.cleaned.clean[120] == 4  # Keep phase 4 after its first transition.
+    assert decision.phase_source == "first_transitions"
+    assert decision.automatic_exclusion_reasons == automatic.reasons
+    kwargs = {
+        "source_task_name": "bimanual_pick_fork",
+        "source_episode_number": 91,
+        "lerobot_episode_index": 0,
+        "global_start_index": 0,
+        "overall_instruction": "Pick up the fork.",
+        "raw_phases": raw,
+        "decision": decision,
+    }
+    audit = oracle.make_episode_audit(**kwargs, replan_steps=10)
+    records = oracle.make_annotation_records(**kwargs)
+    _write_sidecar(tmp_path / "sidecar", [audit], records)
+    _, loaded_records, quality = oracle.load_and_validate_sidecar(tmp_path / "sidecar")
+    assert loaded_records == records
+    assert quality["episodes"][0]["automatic_exclusion_reasons"] == list(automatic.reasons)
+    assert loaded_records[40]["raw_phase_before"] == 1
+    assert loaded_records[40]["clean_phase"] == 2
 
 
 @pytest.mark.parametrize(
-    ("task", "number"),
+    "raw",
     [
-        ("bimanual_edge_phone", 144),
-        ("bimanual_pick_fork", 4),
-        ("bimanual_pick_plate", 15),
-        ("bimanual_pick_plate", 92),
-        ("bimanual_pick_plate", 148),
-        ("bimanual_pick_plate", 0),  # An unreviewed source episode must not inherit fork episode 0's review.
+        _phases((1, 20), (3, 20), (4, 20)),  # A genuinely missing phase must not be invented.
+        _phases((1, 20), (2, 20), (4, 20), (3, 20), (4, 20), (2, 20), (3, 20)),  # First hits out of order.
+        _phases((1, 20), (2, 6), (3, 20), (2, 20), (3, 20), (4, 20)),  # Still ambiguous in a K-step window.
     ],
 )
-def test_bad_and_unreviewed_episodes_remain_excluded(task: str, number: int) -> None:
-    raw = _phases((1, 400))
-    decision = oracle.assess_source_episode(raw, len(raw) - 1, 10, source_task_name=task, source_episode_number=number)
+def test_first_transition_fallback_keeps_unusable_episodes_excluded(raw: np.ndarray) -> None:
+    decision = oracle.assess_source_episode(
+        raw,
+        len(raw) - 1,
+        10,
+        source_task_name="bimanual_pick_fork",
+        source_episode_number=91,
+    )
     assert not decision.included
     assert not decision.anchors
-    assert decision.reasons == ("does_not_end_in_phase_4", "missing_phase")
 
 
-@pytest.mark.parametrize(("num_actions", "replan_steps", "error"), [(200, 10, "outside"), (350, 30, "quality checks")])
-def test_manual_review_rejects_boundaries_incompatible_with_episode_or_timing(
-    num_actions: int, replan_steps: int, error: str
+@pytest.mark.parametrize(
+    ("task", "episode_number", "expected"),
+    [
+        ("bimanual_pick_fork", 90, (40, 72, 85)),
+        ("bimanual_pick_plate", 12, (33, 71, 82)),
+        ("bimanual_pick_plate", 49, (37, 70, 86)),
+        ("bimanual_pick_plate", 68, (27, 70, 85)),
+    ],
+)
+def test_manual_raw_boundaries_map_to_effective_nodes_and_round_trip(
+    tmp_path: pathlib.Path,
+    task: str,
+    episode_number: int,
+    expected: tuple[int, ...],
 ) -> None:
-    with pytest.raises(ValueError, match=error):
-        oracle.assess_source_episode(
-            _phases((1, num_actions + 1)),
-            num_actions,
-            replan_steps,
-            source_task_name="bimanual_pick_plate",
-            source_episode_number=16,
-        )
+    rows = np.arange(0, 300, 3)  # Several manual boundary frames lie inside merged zero-step groups.
+    raw = np.ones(len(rows), dtype=np.int8)
+    decision = oracle.assess_source_episode(
+        raw,
+        len(raw) - 1,
+        10,
+        source_task_name=task,
+        source_episode_number=episode_number,
+        raw_observation_row=rows,
+    )
+    assert decision.included
+    assert decision.phase_source == "manual_raw_boundaries"
+    assert decision.boundaries == expected
+    for phase, boundary in enumerate(expected, start=2):
+        assert decision.cleaned.clean[boundary - 1] == phase - 1
+        assert decision.cleaned.clean[boundary] == phase
+    kwargs = {
+        "source_task_name": task,
+        "source_episode_number": episode_number,
+        "lerobot_episode_index": 0,
+        "global_start_index": 0,
+        "overall_instruction": "Pick up the object.",
+        "raw_phases": raw,
+        "decision": decision,
+    }
+    audit = oracle.make_episode_audit(**kwargs, replan_steps=10, raw_observation_row=rows)
+    records = oracle.make_annotation_records(**kwargs)
+    _write_sidecar(tmp_path / "sidecar", [audit], records)
+    _, loaded_records, quality = oracle.load_and_validate_sidecar(tmp_path / "sidecar")
+    assert loaded_records == records
+    assert quality["episodes"][0]["raw_observation_row"] == rows.tolist()
+
+
+def test_manual_boundaries_override_an_automatic_pass() -> None:
+    raw = _phases((1, 50), (2, 50), (3, 50), (4, 150))
+    assert oracle.assess_episode(raw, len(raw) - 1, 10).included
+    decision = oracle.assess_source_episode(
+        raw,
+        len(raw) - 1,
+        10,
+        source_task_name="bimanual_pick_fork",
+        source_episode_number=90,
+    )
+    assert decision.included
+    assert decision.boundaries == (120, 214, 253)
+    assert decision.phase_source == "manual_raw_boundaries"
 
 
 @pytest.fixture
-def manually_reviewed_sidecar(tmp_path: pathlib.Path) -> pathlib.Path:
-    raw = _phases((1, 20), (2, 3), (1, 20), (2, 20), (1, 20), (2, 60), (3, 80), (4, 140))
+def automatically_cleaned_sidecar(tmp_path: pathlib.Path) -> pathlib.Path:
+    valid_raw = _phases((1, 20), (2, 3), (1, 20), (2, 30), (3, 30), (4, 30))
     episodes = []
     records = []
-    # The LeRobot index 0 intentionally differs from the source episode number 16.
-    for episode_index, number in enumerate((16, 92)):
-        decision = oracle.assess_source_episode(
-            raw, len(raw) - 1, 10, source_task_name="bimanual_pick_plate", source_episode_number=number
-        )
+    for episode_index, raw in enumerate((valid_raw, np.ones_like(valid_raw))):
+        decision = oracle.assess_episode(raw, len(raw) - 1, 10)
         kwargs = {
             "source_task_name": "bimanual_pick_plate",
-            "source_episode_number": number,
+            "source_episode_number": episode_index,
             "lerobot_episode_index": episode_index,
             "global_start_index": episode_index * (len(raw) - 1),
             "overall_instruction": "Pick up the plate.",
@@ -280,23 +349,23 @@ def manually_reviewed_sidecar(tmp_path: pathlib.Path) -> pathlib.Path:
             )
         )
         records.extend(oracle.make_annotation_records(**kwargs))
-    directory = tmp_path / "reviewed_sidecar"
+    directory = tmp_path / "cleaned_sidecar"
     _write_sidecar(directory, episodes, records)
     return directory
 
 
-def test_manual_review_sidecar_round_trips_with_raw_label_audit(manually_reviewed_sidecar: pathlib.Path) -> None:
-    manifest, records, quality = oracle.load_and_validate_sidecar(manually_reviewed_sidecar)
+def test_automatic_sidecar_round_trips_with_raw_label_audit(automatically_cleaned_sidecar: pathlib.Path) -> None:
+    manifest, records, quality = oracle.load_and_validate_sidecar(automatically_cleaned_sidecar)
     assert manifest["included_episode_count"] == manifest["excluded_episode_count"] == 1
-    assert manifest["included_anchor_count"] == len(records) == 362
-    assert {record["source_episode_number"] for record in records} == {16}
-    assert records[90]["raw_phase_before"] == 2
-    assert records[90]["clean_phase"] == 2
-    assert records[90]["subtask_type"] == "1_to_2"
+    assert manifest["included_anchor_count"] == len(records) == 132
+    assert {record["source_episode_number"] for record in records} == {0}
+    assert records[43]["raw_phase_before"] == 2
+    assert records[43]["clean_phase"] == 2
+    assert records[43]["subtask_type"] == "1_to_2"
     assert records[20]["raw_phase_before"] == 2
     assert records[20]["clean_phase"] == 1
     audit = quality["episodes"][0]
-    assert audit["boundaries"] == [90, 242, 266]
+    assert audit["boundaries"] == [43, 73, 103]
     assert audit["raw_runs"] != audit["clean_runs"]
     assert audit["suppressed_segments"] == [
         {"stable_phase": 1, "candidate_phase": 2, "start": 20, "end": 23, "length": 3}
@@ -304,17 +373,17 @@ def test_manual_review_sidecar_round_trips_with_raw_label_audit(manually_reviewe
     assert audit["longest_unconfirmed_deviation"] == 3
 
 
-def test_validator_rejects_resealed_wrong_manual_boundary(manually_reviewed_sidecar: pathlib.Path) -> None:
-    quality_path = manually_reviewed_sidecar / oracle.QUALITY_REPORT_FILENAME
+def test_validator_rejects_resealed_wrong_boundary(automatically_cleaned_sidecar: pathlib.Path) -> None:
+    quality_path = automatically_cleaned_sidecar / oracle.QUALITY_REPORT_FILENAME
     quality = json.loads(quality_path.read_text(encoding="utf-8"))
     audit = quality["episodes"][0]
-    audit["boundaries"][0] = 91
-    audit["clean_runs"][0].update(end=91, length=91)
-    audit["clean_runs"][1].update(start=91, length=151)
+    audit["boundaries"][0] = 44
+    audit["clean_runs"][0].update(end=44, length=44)
+    audit["clean_runs"][1].update(start=44, length=29)
     quality_path.write_text(json.dumps(quality), encoding="utf-8")
-    _reseal_manifest(manually_reviewed_sidecar)
+    _reseal_manifest(automatically_cleaned_sidecar)
     with pytest.raises(ValueError, match="Clean phase sequence mismatch"):
-        oracle.load_and_validate_sidecar(manually_reviewed_sidecar)
+        oracle.load_and_validate_sidecar(automatically_cleaned_sidecar)
 
 
 def test_phase_continuity_mismatch_is_rejected() -> None:
@@ -354,7 +423,7 @@ def test_single_task_variable_episode_sidecar_round_trips(tmp_path: pathlib.Path
     episodes = []
     records = []
     global_cursor = 0
-    for episode_index, episode_number in enumerate((0, 12, 3)):
+    for episode_index, episode_number in enumerate((0, 13, 3)):
         prompt = f"Synthetic overall instruction for {task}."
         episodes.append(
             oracle.make_episode_audit(
@@ -406,49 +475,83 @@ def test_generator_accepts_one_supported_task_with_any_episode_set(tmp_path: pat
 
 
 @pytest.mark.parametrize(
-    "source_action_metadata",
+    ("source_action_metadata", "expected_included"),
     [
-        {"action_semantics": "next_observed_joint_position_observed_gripper"},
-        {"action_semantics": "executed_joint_target_commanded_gripper"},
-        {"action_semantics": "custom_action_definition"},
-        {"action_semantics": ""},
-        {"action_semantics": "  "},
-        {"action_semantics": None},
-        {"action_semantics": 123},
-        {"action_semantics": {"custom": ["any", "format"]}},
-        {},
+        ({"action_semantics": "next_observed_joint_position_observed_gripper"}, True),
+        ({"action_semantics": "executed_joint_target_commanded_gripper"}, True),
+        ({"action_semantics": "custom_action_definition"}, True),
+        ({"action_semantics": ""}, True),
+        ({"action_semantics": "  "}, True),
+        ({"action_semantics": None}, True),
+        ({"action_semantics": 123}, True),
+        ({"action_semantics": {"custom": ["any", "format"]}}, True),
+        ({}, True),
+        ({"action_semantics": "executed_joint_target_commanded_gripper_effective_v2"}, True),
+        ({"action_semantics": "executed_joint_target_commanded_gripper_effective_v2"}, False),
+        ({"action_semantics": "executed_joint_target_commanded_gripper"}, False),
+        ({}, False),
     ],
-    ids=["observed", "executed", "custom", "empty", "whitespace", "null", "integer", "object", "missing"],
+    ids=[
+        "observed",
+        "executed",
+        "custom",
+        "empty",
+        "whitespace",
+        "null",
+        "integer",
+        "object",
+        "missing",
+        "effective_included",
+        "effective_excluded",
+        "raw_excluded",
+        "missing_excluded",
+    ],
 )
 def test_generator_preserves_source_action_semantics_through_sealing_and_loading(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, source_action_metadata: dict
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, source_action_metadata: dict, *, expected_included: bool
 ) -> None:
     source_dir = tmp_path / "export"
-    task = "bimanual_edge_phone"
-    episode_dir = source_dir / "train" / task / "episode0"
-    episode_dir.mkdir(parents=True)
-    raw = _phases((1, 8), (2, 10), (3, 10), (4, 8))
-    num_actions = len(raw) - 1
-    observations = np.arange(len(raw) * 16, dtype=np.float32).reshape(-1, 16)
-    states, actions = observations[:-1], observations[1:]
-    for name, values in (
-        ("state", states),
-        ("actions", actions),
-        ("phase_before_action", raw[:-1]),
-        ("phase_after_action", raw[1:]),
-    ):
-        np.save(episode_dir / f"{name}.npy", values)
-    prompt = "Pick up the phone."
-    metadata = {
-        "task": prompt,
-        "source_task_name": task,
-        "source_episode_number": 0,
-        "phase_semantics": oracle.PHASE_SEMANTICS,
-        "num_observations": len(raw),
-        "num_transitions": num_actions,
-        **source_action_metadata,
-    }
-    (episode_dir / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+    task = "bimanual_pick_plate"
+    episode_number = 16
+    valid_raw = _phases((1, 8), (2, 3), (1, 8), (2, 20), (3, 20), (4, 20))
+    raw = valid_raw if expected_included else _phases((1, 360))
+    source_episodes = [(episode_number, raw)]
+    if not expected_included:
+        # Keep one valid peer: the existing sidecar contract rejects an empty training view.
+        source_episodes.append((17, valid_raw))
+    prompt = "Pick up the plate."
+    state_parts, action_parts, episode_indices, frame_indices = [], [], [], []
+    for episode_index, (source_number, phases) in enumerate(source_episodes):
+        episode_dir = source_dir / "train" / task / f"episode{source_number}"
+        episode_dir.mkdir(parents=True)
+        observations = np.arange(len(phases) * 16, dtype=np.float32).reshape(-1, 16)
+        states, actions = observations[:-1], observations[1:]
+        for name, values in (
+            ("state", states),
+            ("actions", actions),
+            ("phase_before_action", phases[:-1]),
+            ("phase_after_action", phases[1:]),
+        ):
+            np.save(episode_dir / f"{name}.npy", values)
+        metadata = {
+            "task": prompt,
+            "source_task_name": task,
+            "source_episode_number": source_number,
+            "phase_semantics": oracle.PHASE_SEMANTICS,
+            "num_observations": len(phases),
+            "num_transitions": len(actions),
+            **source_action_metadata,
+        }
+        if metadata.get("action_semantics") == "executed_joint_target_commanded_gripper_effective_v2":
+            metadata["effective_index_file"] = "effective_index.npz"
+            np.savez(episode_dir / "effective_index.npz", raw_observation_row=np.arange(len(phases)) * 2)
+        (episode_dir / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+        state_parts.append(states)
+        action_parts.append(actions)
+        episode_indices.extend([episode_index] * len(actions))
+        frame_indices.extend(range(len(actions)))
+    states, actions = np.concatenate(state_parts), np.concatenate(action_parts)
+    num_actions = len(actions)
 
     class FakeHfDataset(dict):
         _fingerprint = "synthetic-fingerprint"
@@ -459,8 +562,8 @@ def test_generator_preserves_source_action_semantics_through_sealing_and_loading
     hf_dataset = FakeHfDataset(
         state=states,
         actions=actions,
-        episode_index=np.zeros(num_actions, dtype=np.int64),
-        frame_index=np.arange(num_actions),
+        episode_index=np.asarray(episode_indices),
+        frame_index=np.asarray(frame_indices),
         task_index=np.zeros(num_actions, dtype=np.int64),
     )
     dataset_root = tmp_path / "lerobot"
@@ -484,16 +587,35 @@ def test_generator_preserves_source_action_semantics_through_sealing_and_loading
     )
 
     manifest, records, quality = oracle.load_and_validate_sidecar(output_dir)
-    assert manifest["num_dataset_rows"] == len(records) == num_actions
+    assert manifest["num_dataset_rows"] == num_actions
+    assert len(records) == len(valid_raw) - 1
+    assert manifest["included_episode_count"] == 1
+    assert manifest["excluded_episode_count"] == int(not expected_included)
     assert [audit["action_semantics"] for audit in quality["episodes"]] == [
         source_action_metadata.get("action_semantics")
-    ]
+    ] * len(source_episodes)
+    audit = quality["episodes"][0]
+    if expected_included:
+        assert audit["boundaries"] == [19, 39, 59]
+        assert audit["longest_unconfirmed_deviation"] == 3
+        assert [record["frame_index"] for record in records] == list(range(num_actions))
+        assert {record["subtask_type"] for record in records} == set(oracle.SUBTASK_TYPES)
+        assert records[8]["raw_phase_before"] == 2
+        assert records[8]["clean_phase"] == 1
+        assert records[19]["subtask_type"] == "1_to_2"
+        assert records[29]["subtask_type"] == "2"
+    else:
+        assert audit["status"] == "excluded"
+        assert audit["reasons"] == ["does_not_end_in_phase_4", "missing_phase"]
+        assert {record["source_episode_number"] for record in records} == {17}
+        assert records[0]["global_index"] == len(raw) - 1
+        assert quality["episodes"][1]["status"] == "included"
 
 
 def test_validator_accepts_omitted_action_semantics(
-    manually_reviewed_sidecar: pathlib.Path, tmp_path: pathlib.Path
+    automatically_cleaned_sidecar: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    _, records, quality = oracle.load_and_validate_sidecar(manually_reviewed_sidecar)
+    _, records, quality = oracle.load_and_validate_sidecar(automatically_cleaned_sidecar)
     for audit in quality["episodes"]:
         audit.pop("action_semantics")
     directory = tmp_path / "sidecar_without_action_semantics"

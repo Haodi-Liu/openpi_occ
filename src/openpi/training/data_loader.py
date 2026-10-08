@@ -131,7 +131,7 @@ class FakeDataset(Dataset):
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Build full LeRobot action chunks, then optionally select the oracle training rows."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -139,6 +139,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # Form H consecutive actions in the base repo before selecting B1 start rows.
     raw_dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
@@ -167,6 +168,19 @@ def create_torch_dataset(
     elif data_config.subtask_replan_steps is not None:
         raise ValueError("subtask_annotations_dir is required with the oracle sidecar.")
 
+    prompt_source = (
+        "oracle sidecar"
+        if data_config.subtask_annotations_dir is not None
+        else ("task" if data_config.prompt_from_task else "dataset")
+    )
+    logging.info(
+        "Loaded %s: %d/%d rows, H=%d, prompt source=%s.",
+        repo_id,
+        len(dataset),
+        len(raw_dataset),
+        action_horizon,
+        prompt_source,
+    )
     return dataset
 
 

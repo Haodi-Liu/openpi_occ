@@ -102,6 +102,18 @@ def _strict_metadata_int(value: Any, name: str) -> int:
     return value
 
 
+def _load_raw_observation_rows(episode_dir: pathlib.Path, metadata: dict[str, Any]) -> np.ndarray:
+    index_file = metadata.get("effective_index_file")
+    if index_file:
+        with np.load(episode_dir / index_file, allow_pickle=False) as index:
+            rows = index["raw_observation_row"]
+    else:
+        if metadata.get("action_semantics") == "executed_joint_target_commanded_gripper_effective_v2":
+            raise ValueError(f"Missing effective_index_file in {episode_dir}.")
+        rows = None
+    return oracle.validate_raw_observation_rows(rows, metadata["num_observations"])
+
+
 def _validate_source_metadata(
     episode_dir: pathlib.Path,
     metadata: dict[str, Any],
@@ -286,12 +298,14 @@ def main(args: Args) -> None:
             task_prompts=task_prompts,
         )
         raw_phases = oracle.reconstruct_observation_phases(phase_before, phase_after)
+        raw_observation_row = _load_raw_observation_rows(episode_dir, metadata)
         decision = oracle.assess_source_episode(
             raw_phases,
             len(actions),
             timing.replan_steps,
             source_task_name=task_name,
             source_episode_number=episode_number,
+            raw_observation_row=raw_observation_row,
         )
         episode_audits.append(
             oracle.make_episode_audit(
@@ -304,8 +318,20 @@ def main(args: Args) -> None:
                 raw_phases=raw_phases,
                 decision=decision,
                 replan_steps=timing.replan_steps,
+                raw_observation_row=raw_observation_row,
             )
         )
+        if decision.phase_source != "automatic" or not decision.included:
+            _LOG.info(
+                "%s/episode%d: %s via %s; effective_boundaries=%s; raw_observation_boundaries=%s; reasons=%s",
+                task_name,
+                episode_number,
+                "included" if decision.included else "excluded",
+                decision.phase_source,
+                decision.boundaries,
+                tuple(int(raw_observation_row[index]) for index in decision.boundaries),
+                decision.reasons,
+            )
         records.extend(
             oracle.make_annotation_records(
                 source_task_name=task_name,

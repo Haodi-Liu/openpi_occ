@@ -9,19 +9,24 @@ Expected input layout (produced by `examples/rlbench/export_rlbench_split.py`):
         state.npy
         actions.npy
         meta.json
+        effective_index.npz  # effective_v2 exports only
 
 This script writes a LeRobot dataset that can be consumed by the OpenPI
 training pipeline. The vector layout is the 16D left-first joint-control layout:
 
     [left_joint_positions(7), left_gripper_open(1),
      right_joint_positions(7), right_gripper_open(1)]
+
+Each exported transition becomes one LeRobot frame: its mapped current images
+and measured state, plus the next retained node's commanded action. Effective
+physics_step gaps are not resampled; fps defines logical row timestamps only.
+Stage cleanup and training-row selection belong to the later oracle sidecar.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-import shutil
 
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -81,6 +86,8 @@ VECTOR_FEATURES = {
 
 JOINT16_GRIPPER_IDXS = (7, 15)
 GRIPPER_VALUE_ATOL = 1e-5
+RAW_ACTION_SEMANTICS = "executed_joint_target_commanded_gripper"
+EFFECTIVE_ACTION_SEMANTICS = "executed_joint_target_commanded_gripper_effective_v2"
 
 
 def load_rgb(path: Path) -> np.ndarray:
@@ -92,10 +99,42 @@ def load_rgb(path: Path) -> np.ndarray:
 
 
 def sorted_episode_dirs(split_dir: Path) -> list[Path]:
+    # The oracle sidecar uses this same lexical order to recover episode_index.
     return sorted(
         [path for path in split_dir.glob("*/*") if path.is_dir()],
         key=lambda path: (path.parent.name, path.name),
     )
+
+
+def validate_export_semantics(episode_dirs: list[Path]) -> str:
+    """Reject mixed or obsolete exports before creating the output repository."""
+    semantics = {
+        json.loads((episode_dir / "meta.json").read_text()).get("action_semantics") for episode_dir in episode_dirs
+    }
+    if len(semantics) != 1:
+        raise ValueError(f"Cannot mix action_semantics in one LeRobot repository: {semantics}")
+    action_semantics = semantics.pop()
+    if action_semantics not in (RAW_ACTION_SEMANTICS, EFFECTIVE_ACTION_SEMANTICS):
+        raise ValueError(f"Unsupported action_semantics: {action_semantics!r}; regenerate the export")
+    return action_semantics
+
+
+def validate_effective_index(episode_dir: Path, metadata: dict, num_frames: int) -> None:
+    """Check the effective node count and timing without expanding physical gaps."""
+    num_nodes = num_frames + 1
+    if metadata.get("num_transitions") != num_frames or metadata.get("num_observations") != num_nodes:
+        raise ValueError(f"Effective export must have {num_frames} transitions and {num_nodes} nodes: {episode_dir}")
+    index_file = metadata.get("effective_index_file")
+    if not index_file:
+        raise ValueError(f"Missing effective_index_file in {episode_dir / 'meta.json'}")
+    with np.load(episode_dir / index_file, allow_pickle=False) as index:
+        for key in ("raw_observation_row", "raw_command_row", "physics_step"):
+            values = index[key]
+            if values.shape != (num_nodes,) or not np.issubdtype(values.dtype, np.integer):
+                raise ValueError(f"Expected {key} to contain {num_nodes} integer node entries: {episode_dir}")
+        physics_step = index["physics_step"]
+        if physics_step[0] != 0 or np.any(physics_step[1:] <= physics_step[:-1]):
+            raise ValueError(f"Effective physics_step must start at 0 and strictly increase: {episode_dir}")
 
 
 def validate_joint16_array(array: np.ndarray, path: Path) -> None:
@@ -127,8 +166,8 @@ def validate_episode_artifacts(episode_dir: Path) -> tuple[np.ndarray, np.ndarra
     if not meta_path.is_file():
         raise FileNotFoundError(f"Missing meta.json: {meta_path}")
 
-    states = np.asarray(np.load(state_path), dtype=np.float32)
-    actions = np.asarray(np.load(actions_path), dtype=np.float32)
+    states = np.asarray(np.load(state_path, allow_pickle=False), dtype=np.float32)
+    actions = np.asarray(np.load(actions_path, allow_pickle=False), dtype=np.float32)
     metadata = json.loads(meta_path.read_text())
 
     validate_joint16_array(states, state_path)
@@ -147,6 +186,9 @@ def validate_episode_artifacts(episode_dir: Path) -> tuple[np.ndarray, np.ndarra
     if "task" not in metadata:
         raise KeyError(f"Missing 'task' in {meta_path}")
 
+    if metadata["action_semantics"] == EFFECTIVE_ACTION_SEMANTICS:
+        validate_effective_index(episode_dir, metadata, len(states))
+
     return states, actions, metadata
 
 
@@ -160,7 +202,7 @@ def create_dataset(
 ) -> tuple[LeRobotDataset, Path]:
     dataset_root = (Path(output_root).expanduser().resolve() / repo_id) if output_root else (HF_LEROBOT_HOME / repo_id)
     if dataset_root.exists():
-        shutil.rmtree(dataset_root)
+        raise FileExistsError(f"Dataset already exists: {dataset_root}. Choose a new repo_id or output_root.")
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
@@ -178,10 +220,9 @@ def main(
     input_dir: str,
     split: str,
     repo_id: str,
-    *,
     fps: int = 20,
     output_root: str | None = None,
-    push_to_hub: bool = False,
+    push_to_hub: bool = False,  # noqa: FBT001, FBT002 - Tyro CLI option.
     image_writer_threads: int = 10,
     image_writer_processes: int = 5,
 ) -> None:
@@ -193,6 +234,7 @@ def main(
     episode_dirs = sorted_episode_dirs(split_dir)
     if not episode_dirs:
         raise FileNotFoundError(f"No episode directories found under: {split_dir}")
+    action_semantics = validate_export_semantics(episode_dirs)
 
     dataset, dataset_root = create_dataset(
         repo_id,
@@ -204,26 +246,27 @@ def main(
 
     total_frames = 0
     task_names = set()
-    for episode_dir in episode_dirs:
-        states, actions, metadata = validate_episode_artifacts(episode_dir)
-        task_prompt = str(metadata["task"])
-        task_names.add(task_prompt)
+    try:
+        for episode_dir in episode_dirs:
+            states, actions, metadata = validate_episode_artifacts(episode_dir)
+            task_prompt = str(metadata["task"])
+            task_names.add(task_prompt)
 
-        for idx in range(len(states)):
-            dataset.add_frame(
-                {
-                    "front_rgb": load_rgb(Path(metadata["front_rgb"][idx])),
-                    "wrist_left_rgb": load_rgb(Path(metadata["wrist_left_rgb"][idx])),
-                    "wrist_right_rgb": load_rgb(Path(metadata["wrist_right_rgb"][idx])),
-                    "state": states[idx],
-                    "actions": actions[idx],
-                    "task": task_prompt,
-                }
-            )
-        dataset.save_episode()
-        total_frames += len(states)
-
-    dataset.stop_image_writer()
+            for idx in range(len(states)):
+                dataset.add_frame(
+                    {
+                        "front_rgb": load_rgb(Path(metadata["front_rgb"][idx])),
+                        "wrist_left_rgb": load_rgb(Path(metadata["wrist_left_rgb"][idx])),
+                        "wrist_right_rgb": load_rgb(Path(metadata["wrist_right_rgb"][idx])),
+                        "state": states[idx],
+                        "actions": actions[idx],
+                        "task": task_prompt,
+                    }
+                )
+            dataset.save_episode()
+            total_frames += len(states)
+    finally:
+        dataset.stop_image_writer()
 
     if push_to_hub:
         dataset.push_to_hub(tags=["rlbench", "bimanual", "joint-control"], private=False)
@@ -238,6 +281,7 @@ def main(
                 "num_episodes": len(episode_dirs),
                 "num_frames": total_frames,
                 "num_tasks": len(task_names),
+                "action_semantics": action_semantics,
                 "vector_layout": JOINT16_DIM_NAMES,
             },
             ensure_ascii=False,

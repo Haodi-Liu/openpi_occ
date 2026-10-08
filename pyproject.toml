@@ -135,6 +135,7 @@ known-third-party = ["wandb"]
 [tool.ruff.lint.per-file-ignores]
 # The exporter runs in the separate RLBench Python 3.8 environment.
 "examples/rlbench/export_rlbench_split.py" = ["UP038"]
+"examples/rlbench/enablement_sim_worker.py" = ["UP038"]
 # Its regression tests deliberately use the standard library unittest runner.
 "examples/rlbench/export_rlbench_split_test.py" = ["PT009", "PT027"]
 

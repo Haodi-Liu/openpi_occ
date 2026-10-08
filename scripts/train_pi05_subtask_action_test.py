@@ -124,6 +124,9 @@ def test_build_train_config_inherits_base_budget_and_allows_explicit_smoke_overr
     assert config.ema_decay == base.ema_decay == configured_base.ema_decay == 0.999
     assert config.data.repo_id == "local/oracle"
     assert config.data.assets.asset_id == "local/oracle"
+    assert configured_base.data.base_config.subtask_annotations_dir is None
+    assert configured_base.data.base_config.subtask_replan_steps is None
+    assert config.data.base_config.prompt_from_task
     assert config.data.base_config.subtask_annotations_dir == str((tmp_path / "sidecar").resolve())
     assert config.data.base_config.subtask_replan_steps == timing.replan_steps
     assert trainer._training_contract("action_only") == (1, oracle.ACTION_TRAINABLE_PROTOCOL)  # noqa: SLF001

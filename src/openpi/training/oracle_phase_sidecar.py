@@ -97,52 +97,16 @@ MANIFEST_FILENAME = "manifest.json"
 PHASE_SEMANTICS = "observation_phase_type_before_after_action"
 PERSISTENCE_FORMULA = "ceil(0.6 * replan_steps)"
 PHASE_ALIGNMENT = "phase_before_action[t]=observation[t];phase_after_action[t]=observation[t+1]"
-BOUNDARY_RULE = (
-    "confirm_after_p_consecutive_observations_then_backdate_to_candidate_start"
-    "_then_apply_manual_review_to_excluded_episodes"
-)
+BOUNDARY_RULE = "persistence_then_first_phase_entries_with_manual_raw_boundaries"
+# Zero-based raw observation rows; each boundary is the first row of the new phase.
+MANUAL_RAW_BOUNDARIES = {
+    ("bimanual_pick_fork", 90): (120, 214, 253),
+    ("bimanual_pick_plate", 12): (97, 211, 245),
+    ("bimanual_pick_plate", 49): (109, 210, 257),
+    ("bimanual_pick_plate", 68): (80, 210, 253),
+}
 ANCHOR_RULE = "every_action_frame_uses_one_transition_from_previous_open_closed_k_window_else_current_phase"
 ROLE_WORD_POLICY = "task_specific_functional_arm_roles"
-
-# Applied only after automatic exclusion. Keys use source episode numbers, not LeRobot indices.
-# Each boundary is the zero-based first observation/action frame of the new phase; None means bad demo.
-MANUAL_PHASE_REVIEW: dict[tuple[str, int], tuple[int, int, int] | None] = {
-    ("bimanual_edge_phone", 144): None,
-    ("bimanual_pick_fork", 0): (77, 190, 228),
-    ("bimanual_pick_fork", 1): (82, 185, 223),
-    ("bimanual_pick_fork", 4): None,
-    ("bimanual_pick_fork", 14): (84, 191, 237),
-    ("bimanual_pick_fork", 15): (76, 185, 222),
-    ("bimanual_pick_fork", 18): (72, 189, 224),
-    ("bimanual_pick_fork", 21): (83, 194, 237),
-    ("bimanual_pick_fork", 23): (67, 209, 244),
-    ("bimanual_pick_fork", 35): (83, 187, 227),
-    ("bimanual_pick_fork", 38): (77, 189, 226),
-    ("bimanual_pick_fork", 59): (82, 239, 278),
-    ("bimanual_pick_fork", 82): (99, 215, 256),
-    ("bimanual_pick_fork", 85): (85, 184, 222),
-    ("bimanual_pick_fork", 87): (87, 192, 237),
-    ("bimanual_pick_fork", 95): (92, 198, 243),
-    ("bimanual_pick_fork", 109): (71, 206, 242),
-    ("bimanual_pick_fork", 113): (91, 190, 242),
-    ("bimanual_pick_plate", 15): None,
-    ("bimanual_pick_plate", 16): (90, 242, 266),
-    ("bimanual_pick_plate", 26): (86, 235, 280),
-    ("bimanual_pick_plate", 43): (86, 223, 260),
-    ("bimanual_pick_plate", 51): (77, 225, 270),
-    ("bimanual_pick_plate", 52): (109, 228, 279),
-    ("bimanual_pick_plate", 59): (100, 252, 285),
-    ("bimanual_pick_plate", 81): (75, 227, 265),
-    ("bimanual_pick_plate", 86): (80, 175, 281),
-    ("bimanual_pick_plate", 92): None,
-    ("bimanual_pick_plate", 95): (88, 205, 245),
-    ("bimanual_pick_plate", 104): (104, 220, 261),
-    ("bimanual_pick_plate", 107): (82, 211, 249),
-    ("bimanual_pick_plate", 112): (86, 220, 262),
-    ("bimanual_pick_plate", 129): (77, 239, 278),
-    ("bimanual_pick_plate", 148): None,
-    ("bimanual_pivot_phone", 66): (102, 200, 263),
-}
 
 EXCLUSION_REASONS = (
     "does_not_start_in_phase_1",
@@ -187,6 +151,9 @@ _EPISODE_AUDIT_FIELDS = {
     "boundaries",
     "suppressed_segments",
     "longest_unconfirmed_deviation",
+    "raw_observation_row",
+    "phase_source",
+    "automatic_exclusion_reasons",
 }
 _RUN_FIELDS = {"phase", "start", "end", "length"}
 _SUPPRESSED_FIELDS = {"stable_phase", "candidate_phase", "start", "end", "length"}
@@ -286,6 +253,8 @@ class EpisodeDecision:
     boundaries: tuple[int, ...]
     anchors: tuple[Anchor, ...]
     candidate_anchor_count: int
+    phase_source: str = "automatic"
+    automatic_exclusion_reasons: tuple[str, ...] = ()
 
 
 def canonical_sha256(value: Any) -> str:
@@ -523,6 +492,16 @@ def assess_episode(raw: Any, num_actions: int, replan_steps: int) -> EpisodeDeci
     )
 
 
+def validate_raw_observation_rows(rows: Any, num_nodes: int) -> np.ndarray:
+    """Map effective observations to strictly increasing, zero-based raw frame numbers."""
+    if rows is None:
+        return np.arange(num_nodes, dtype=np.int64)
+    rows = np.asarray(rows)
+    if rows.shape != (num_nodes,) or rows.dtype.kind not in "iu" or np.any(rows < 0) or np.any(rows[1:] <= rows[:-1]):
+        raise ValueError("raw_observation_row must contain one increasing non-negative integer per observation.")
+    return rows.astype(np.int64, copy=False)
+
+
 def assess_source_episode(
     raw: Any,
     num_actions: int,
@@ -530,32 +509,38 @@ def assess_source_episode(
     *,
     source_task_name: str,
     source_episode_number: int,
+    raw_observation_row: Any = None,
 ) -> EpisodeDecision:
-    """Run unchanged automatic cleaning, then apply the fixed review to excluded source episodes."""
-    automatic = assess_episode(raw, num_actions, replan_steps)
-    if automatic.included:
+    """Keep automatic passes; repair exclusions at first phase entries; manual rows take priority."""
+    raw_array = _validate_phase_sequence_length(raw, num_actions, "raw_phases")
+    rows = validate_raw_observation_rows(raw_observation_row, len(raw_array))
+    automatic = assess_episode(raw_array, num_actions, replan_steps)
+    manual = MANUAL_RAW_BOUNDARIES.get((source_task_name, source_episode_number))
+    if manual is not None:
+        boundaries = np.asarray(manual, dtype=np.int64)
+        phase_source = "manual_raw_boundaries"
+    elif automatic.included:
         return automatic
-    identity = (source_task_name, source_episode_number)
-    boundaries = MANUAL_PHASE_REVIEW.get(identity)
-    if boundaries is None:
-        return automatic
-    if not 0 < boundaries[0] < boundaries[1] < boundaries[2] < num_actions:
-        raise ValueError(f"Manual phase boundaries {boundaries} are outside source episode {identity}.")
+    else:
+        first_entries = []
+        for phase in (2, 3, 4):
+            # Earlier regressions do not change where this phase first begins.
+            hits = np.flatnonzero(raw_array == phase)
+            if not len(hits):
+                return automatic
+            first_entries.append(int(rows[hits[0]]))
+        boundaries = np.asarray(first_entries, dtype=np.int64)
+        if np.any(np.diff(boundaries) <= 0):
+            return automatic
+        phase_source = "first_transitions"
 
-    manual = np.ones(num_actions + 1, dtype=np.int8)
-    for phase, boundary in enumerate(boundaries, start=2):
-        manual[boundary:] = phase
-    reviewed = assess_episode(manual, num_actions, replan_steps)
-    if not reviewed.included:
-        raise ValueError(f"Manual phase boundaries for {identity} fail quality checks: {reviewed.reasons}.")
-    # Keep the raw-label cleaning diagnostics while using the reviewed phases for all training anchors.
+    # Relabel only the existing effective nodes. A merged group uses its final raw row.
+    relabeled = (np.searchsorted(boundaries, rows, side="right") + 1).astype(np.int8)
+    decision = assess_episode(relabeled, num_actions, replan_steps)
     return dataclasses.replace(
-        reviewed,
-        cleaned=dataclasses.replace(
-            reviewed.cleaned,
-            suppressed=automatic.cleaned.suppressed,
-            longest_unconfirmed_deviation=automatic.cleaned.longest_unconfirmed_deviation,
-        ),
+        decision,
+        phase_source=phase_source,
+        automatic_exclusion_reasons=automatic.reasons,
     )
 
 
@@ -570,6 +555,7 @@ def make_episode_audit(
     decision: EpisodeDecision,
     replan_steps: int,
     action_semantics: Any = None,
+    raw_observation_row: Any = None,
 ) -> dict[str, Any]:
     """Create a portable episode audit preserving the source export's action semantics."""
     if source_task_name not in TASKS:
@@ -581,12 +567,14 @@ def make_episode_audit(
         raise ValueError("overall_instruction must be a non-empty string.")
     raw_array = validate_phase_array(raw_phases, "raw_phases")
     num_actions = len(raw_array) - 1
+    rows = validate_raw_observation_rows(raw_observation_row, len(raw_array))
     recomputed = assess_source_episode(
         raw_array,
         num_actions,
         replan_steps,
         source_task_name=source_task_name,
         source_episode_number=source_episode_number,
+        raw_observation_row=rows,
     )
     if _decision_signature(decision) != _decision_signature(recomputed):
         raise ValueError("Episode decision does not match the supplied raw phases.")
@@ -606,6 +594,9 @@ def make_episode_audit(
         "included_anchor_count": len(decision.anchors),
         "status": "included" if decision.included else "excluded",
         "reasons": list(decision.reasons),
+        "phase_source": decision.phase_source,
+        "automatic_exclusion_reasons": list(decision.automatic_exclusion_reasons),
+        "raw_observation_row": rows.tolist(),
         "raw_runs": [run.to_dict() for run in run_length_encode(raw_array)],
         "clean_runs": [run.to_dict() for run in decision.cleaned.runs],
         "boundaries": list(decision.boundaries),
@@ -719,6 +710,7 @@ def compute_source_content_sha256(episodes: Sequence[Mapping[str, Any]]) -> str:
                 "phase_semantics": episode["phase_semantics"],
                 "phase_before_action": raw[:-1].tolist(),
                 "phase_after_action": raw[1:].tolist(),
+                "raw_observation_row": episode["raw_observation_row"],
             }
         )
     return canonical_sha256(source_entries)
@@ -971,6 +963,8 @@ def _decision_signature(decision: EpisodeDecision) -> tuple[Any, ...]:
         decision.boundaries,
         decision.anchors,
         decision.candidate_anchor_count,
+        decision.phase_source,
+        decision.automatic_exclusion_reasons,
     )
 
 
@@ -1130,7 +1124,12 @@ def _validate_quality_and_records(
             int(manifest["replan_steps"]),
             source_task_name=task,
             source_episode_number=source_number,
+            raw_observation_row=audit["raw_observation_row"],
         )
+        if audit["phase_source"] != decision.phase_source or audit["automatic_exclusion_reasons"] != list(
+            decision.automatic_exclusion_reasons
+        ):
+            raise ValueError(f"Phase source or automatic exclusion reasons mismatch at audit {expected_episode_index}.")
         if not np.array_equal(clean, decision.cleaned.clean):
             raise ValueError(f"Clean phase sequence mismatch at audit {expected_episode_index}.")
         expected_suppressed = [segment.to_dict() for segment in decision.cleaned.suppressed]
